@@ -3,8 +3,7 @@ library(Biostrings)
 library(edgeR)
 
 # Script to create a simulated RNA-seq dataset for needle workshop
-# Generates synthetic reads from transcripts with varying cancer gene expression
-# No external polyester dependency required
+# Optimized for speed - generates pooled reads per sample
 
 args = commandArgs(trailingOnly=TRUE)
 if (length(args)==0) {
@@ -25,7 +24,6 @@ cancer_gene_indices = sample(1:num_transcripts, num_cancer_genes)
 num_patients = 24
 num_replicates = 2
 coverage = 30
-bp_length = 75
 readlen = 75
 
 # Risk assignments
@@ -45,61 +43,21 @@ if (!dir.exists("data/cancer_gene_expression")) {
   dir.create("data/cancer_gene_expression")
 }
 
-# Helper function to generate synthetic reads
-generate_reads <- function(sequence, num_reads, readlen, output_file, seed) {
-  set.seed(seed)
+# Helper function to write FASTQ records
+write_fastq_records <- function(sequences, qualities, output_file) {
+  handle <- file(output_file, "w")
   
-  seq_length <- nchar(sequence)
-  
-  # Generate forward and reverse reads
-  read1_file <- gsub(".fq.gz$", "_1.fq", output_file)
-  read2_file <- gsub(".fq.gz$", "_2.fq", output_file)
-  
-  read1_handle <- file(read1_file, "w")
-  read2_handle <- file(read2_file, "w")
-  
-  for (i in 1:num_reads) {
-    # Random start position for forward read
-    start_pos <- sample(1:(seq_length - readlen + 1), 1)
-    end_pos <- start_pos + readlen - 1
-    
-    # Generate forward read
-    forward_seq <- substr(sequence, start_pos, end_pos)
-    
-    # Generate reverse read (from different position)
-    start_pos_rev <- sample(1:(seq_length - readlen + 1), 1)
-    end_pos_rev <- start_pos_rev + readlen - 1
-    reverse_seq <- substr(sequence, start_pos_rev, end_pos_rev)
-    # Reverse complement
-    reverse_seq <- as.character(reverseComplement(DNAString(reverse_seq)))
-    
-    # Generate quality scores (simulate high quality)
-    quality <- paste(rep("I", readlen), collapse = "")
-    
-    # Write to FASTQ
+  for (i in 1:length(sequences)) {
     writeLines(c(
       paste0("@read_", i, "/1"),
-      forward_seq,
+      sequences[i],
       "+",
-      quality
-    ), read1_handle)
-    
-    writeLines(c(
-      paste0("@read_", i, "/2"),
-      reverse_seq,
-      "+",
-      quality
-    ), read2_handle)
+      qualities[i]
+    ), handle)
   }
   
-  close(read1_handle)
-  close(read2_handle)
-  
-  # Compress
-  system(paste("gzip -f", read1_file))
-  system(paste("gzip -f", read2_file))
-  
-  return(paste(read1_file, ".gz", sep = ""))
+  close(handle)
+  system(paste("gzip -f", output_file))
 }
 
 # Main simulation loop
@@ -143,7 +101,8 @@ for (patient_id in 1:num_patients) {
               col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
   
   # Calculate reads per transcript
-  readspertx = round(coverage * width(fasta) / bp_length)
+  tx_lengths = width(fasta)
+  readspertx = round(coverage * tx_lengths / readlen)
   
   # Create patient directory
   patient_dir = paste0("data/patient_", sprintf("%02d", patient_id), "_", risk_level)
@@ -151,24 +110,41 @@ for (patient_id in 1:num_patients) {
   
   # Generate reads for each replicate
   for (rep in 1:num_replicates) {
-    # Generate reads for this replicate
+    set.seed(patient_id * 1000 + rep)
+    
+    all_sequences = character()
+    all_qualities = character()
+    
+    # Pool reads from all transcripts for this replicate
     for (tx_idx in 1:num_transcripts) {
-      num_reads <- readspertx[tx_idx] * fold_changes[tx_idx]
+      num_reads = round(readspertx[tx_idx] * fold_changes[tx_idx])
       
       if (num_reads > 0) {
-        sequence <- as.character(fasta[[tx_idx]])
-        output_file <- paste0(patient_dir, "/sample_", sprintf("%02d", rep), 
-                             "_transcript_", sprintf("%05d", tx_idx), ".fq.gz")
+        sequence = as.character(fasta[[tx_idx]])
+        seq_length = nchar(sequence)
         
-        generate_reads(sequence, round(num_reads), readlen, output_file, 
-                      seed = (patient_id * 1000 + rep * 100 + tx_idx))
+        # Generate reads from random positions
+        start_positions = sample(1:(seq_length - readlen + 1), num_reads, replace = TRUE)
+        
+        for (pos in start_positions) {
+          read_seq = substr(sequence, pos, pos + readlen - 1)
+          all_sequences = c(all_sequences, read_seq)
+          all_qualities = c(all_qualities, paste(rep("I", readlen), collapse = ""))
+        }
       }
     }
+    
+    # Write pooled FASTQ file
+    output_file = paste0(patient_dir, "/sample_", sprintf("%02d", rep), ".fq")
+    write_fastq_records(all_sequences, all_qualities, output_file)
+    
+    num_total_reads = length(all_sequences)
+    print(paste("Generated patient", sprintf("%02d", patient_id), 
+                "- Risk level:", risk_level,
+                "- Replicate:", rep,
+                "- Reads:", num_total_reads,
+                "- Coverage:", coverage))
   }
-  
-  print(paste("Generated patient", sprintf("%02d", patient_id), 
-              "- Risk level:", risk_level,
-              "- Coverage:", coverage))
   
   # Increase coverage every 8 patients
   if ((patient_id %% 8) == 0) {
