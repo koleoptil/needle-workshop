@@ -88,12 +88,26 @@ for (patient_id in 1:num_patients) {
   }
   
   # Write cancer gene expression file
-  elevated_genes_info = data.frame(
-    gene_id = names(fasta[which(fold_changes > 1)]),
-    fold_change = fold_changes[which(fold_changes > 1)],
-    risk_level = risk_level,
-    patient_id = patient_id
-  )
+  elevated_indices = which(fold_changes > 1)
+  
+  if (length(elevated_indices) > 0) {
+    elevated_genes_info = data.frame(
+      gene_id = names(fasta[elevated_indices]),
+      fold_change = fold_changes[elevated_indices],
+      risk_level = risk_level,
+      patient_id = patient_id,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    # Create empty data frame with correct structure for patients with no elevated genes
+    elevated_genes_info = data.frame(
+      gene_id = character(0),
+      fold_change = numeric(0),
+      risk_level = character(0),
+      patient_id = numeric(0),
+      stringsAsFactors = FALSE
+    )
+  }
   
   write.table(elevated_genes_info, 
               file = paste0("data/cancer_gene_expression/patient_", 
