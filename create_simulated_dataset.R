@@ -1,11 +1,10 @@
 #!/usr/bin/env Rscript
 library(Biostrings)
 library(edgeR)
-library(polyester)
 
 # Script to create a simulated RNA-seq dataset for needle workshop
-# Compares needle (fast) vs salmon/kallisto (slower) for expression estimation
-# Includes cancer-associated genes with varying risk profiles across patients
+# Generates synthetic reads from transcripts with varying cancer gene expression
+# No external polyester dependency required
 
 args = commandArgs(trailingOnly=TRUE)
 if (length(args)==0) {
@@ -18,22 +17,18 @@ fastapath = args[1]
 fasta = readDNAStringSet(fastapath)
 num_transcripts = length(fasta)
 
-# Define cancer-associated genes (we'll simulate these by selecting random transcripts)
-num_cancer_genes = max(50, round(0.05 * num_transcripts))  # 5% of transcripts as "cancer genes"
+# Define cancer-associated genes (5% of transcripts)
+num_cancer_genes = max(50, round(0.05 * num_transcripts))
 cancer_gene_indices = sample(1:num_transcripts, num_cancer_genes)
 
 # Simulation parameters
-num_patients = 24  # Creates 24 patient samples (reasonable for a workshop)
-num_replicates = 2  # Technical replicates per patient
-coverage = 30      # Coverage depth (higher = more data, longer runtime for salmon/kallisto)
-bp_length = 75     # Read length
+num_patients = 24
+num_replicates = 2
+coverage = 30
+bp_length = 75
 readlen = 75
 
-# Risk categories:
-# - 8 low-risk patients: 0-1 cancer genes with high expression
-# - 8 medium-risk patients: 2-3 cancer genes with high expression
-# - 8 high-risk patients: 4-6 cancer genes with high expression
-
+# Risk assignments
 risk_assignments = rep(c("low", "medium", "high"), length.out = num_patients)
 
 print("Starting simulated dataset generation...")
@@ -50,81 +45,132 @@ if (!dir.exists("data/cancer_gene_expression")) {
   dir.create("data/cancer_gene_expression")
 }
 
+# Helper function to generate synthetic reads
+generate_reads <- function(sequence, num_reads, readlen, output_file, seed) {
+  set.seed(seed)
+  
+  seq_length <- nchar(sequence)
+  
+  # Generate forward and reverse reads
+  read1_file <- gsub(".fq.gz$", "_1.fq", output_file)
+  read2_file <- gsub(".fq.gz$", "_2.fq", output_file)
+  
+  read1_handle <- file(read1_file, "w")
+  read2_handle <- file(read2_file, "w")
+  
+  for (i in 1:num_reads) {
+    # Random start position for forward read
+    start_pos <- sample(1:(seq_length - readlen + 1), 1)
+    end_pos <- start_pos + readlen - 1
+    
+    # Generate forward read
+    forward_seq <- substr(sequence, start_pos, end_pos)
+    
+    # Generate reverse read (from different position)
+    start_pos_rev <- sample(1:(seq_length - readlen + 1), 1)
+    end_pos_rev <- start_pos_rev + readlen - 1
+    reverse_seq <- substr(sequence, start_pos_rev, end_pos_rev)
+    # Reverse complement
+    reverse_seq <- as.character(reverseComplement(DNAString(reverse_seq)))
+    
+    # Generate quality scores (simulate high quality)
+    quality <- paste(rep("I", readlen), collapse = "")
+    
+    # Write to FASTQ
+    writeLines(c(
+      paste0("@read_", i, "/1"),
+      forward_seq,
+      "+",
+      quality
+    ), read1_handle)
+    
+    writeLines(c(
+      paste0("@read_", i, "/2"),
+      reverse_seq,
+      "+",
+      quality
+    ), read2_handle)
+  }
+  
+  close(read1_handle)
+  close(read2_handle)
+  
+  # Compress
+  system(paste("gzip -f", read1_file))
+  system(paste("gzip -f", read2_file))
+  
+  return(paste(read1_file, ".gz", sep = ""))
+}
+
+# Main simulation loop
 for (patient_id in 1:num_patients) {
   risk_level = risk_assignments[patient_id]
   
-  # Initialize fold changes (baseline = 1 in all samples)
-  fold_changes = matrix(rep(1, num_transcripts * num_replicates), 
-                        nrow = num_transcripts, 
-                        ncol = num_replicates)
+  # Initialize fold changes
+  fold_changes = rep(1, num_transcripts)
   
   # Assign expression patterns based on risk level
   if (risk_level == "low") {
-    # 0-1 cancer genes with moderate elevation (2-3x)
     num_elevated = sample(0:1, 1)
     if (num_elevated > 0) {
       elevated_genes = sample(cancer_gene_indices, num_elevated)
       fold_change_values = sample(c(2, 3), num_elevated, replace = TRUE)
-      for (i in 1:num_elevated) {
-        fold_changes[elevated_genes[i], ] = fold_change_values[i]
-      }
+      fold_changes[elevated_genes] = fold_change_values
     }
   } else if (risk_level == "medium") {
-    # 2-3 cancer genes with higher elevation (3-6x)
     num_elevated = sample(2:3, 1)
     elevated_genes = sample(cancer_gene_indices, num_elevated)
     fold_change_values = sample(c(3, 4, 5, 6), num_elevated, replace = TRUE)
-    for (i in 1:num_elevated) {
-      fold_changes[elevated_genes[i], ] = fold_change_values[i]
-    }
+    fold_changes[elevated_genes] = fold_change_values
   } else if (risk_level == "high") {
-    # 4-6 cancer genes with very high elevation (5-10x)
     num_elevated = sample(4:6, 1)
     elevated_genes = sample(cancer_gene_indices, num_elevated)
     fold_change_values = sample(c(5, 6, 7, 8, 9, 10), num_elevated, replace = TRUE)
-    for (i in 1:num_elevated) {
-      fold_changes[elevated_genes[i], ] = fold_change_values[i]
-    }
+    fold_changes[elevated_genes] = fold_change_values
   }
   
-  # Write cancer gene expression file (for downstream analysis)
+  # Write cancer gene expression file
   elevated_genes_info = data.frame(
-    gene_id = names(fasta[which(fold_changes[, 1] > 1)]),
-    fold_change = fold_changes[which(fold_changes[, 1] > 1), 1],
+    gene_id = names(fasta[which(fold_changes > 1)]),
+    fold_change = fold_changes[which(fold_changes > 1)],
     risk_level = risk_level,
     patient_id = patient_id
   )
+  
   write.table(elevated_genes_info, 
               file = paste0("data/cancer_gene_expression/patient_", 
                            sprintf("%02d", patient_id), "_genes.tsv"),
               col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
   
-  # Calculate reads per transcript based on coverage
+  # Calculate reads per transcript
   readspertx = round(coverage * width(fasta) / bp_length)
   
-  # Create patient-specific output directory
+  # Create patient directory
   patient_dir = paste0("data/patient_", sprintf("%02d", patient_id), "_", risk_level)
   dir.create(patient_dir, showWarnings = FALSE)
   
-  # Simulate reads for this patient (with replicates)
-  simulate_experiment(
-    fastapath,
-    reads_per_transcript = readspertx,
-    num_reps = c(num_replicates, num_replicates),  # Two conditions with replicates each
-    outdir = patient_dir,
-    fold_changes = fold_changes,
-    seed = (patient_id * 142),  # Different seed per patient
-    readlen = readlen,
-    paired = TRUE,
-    gzip = TRUE
-  )
+  # Generate reads for each replicate
+  for (rep in 1:num_replicates) {
+    # Generate reads for this replicate
+    for (tx_idx in 1:num_transcripts) {
+      num_reads <- readspertx[tx_idx] * fold_changes[tx_idx]
+      
+      if (num_reads > 0) {
+        sequence <- as.character(fasta[[tx_idx]])
+        output_file <- paste0(patient_dir, "/sample_", sprintf("%02d", rep), 
+                             "_transcript_", sprintf("%05d", tx_idx), ".fq.gz")
+        
+        generate_reads(sequence, round(num_reads), readlen, output_file, 
+                      seed = (patient_id * 1000 + rep * 100 + tx_idx))
+      }
+    }
+  }
   
   print(paste("Generated patient", sprintf("%02d", patient_id), 
               "- Risk level:", risk_level,
               "- Coverage:", coverage))
   
-  # Increase coverage every 8 patients to make the dataset progressively larger
-  # This ensures later patients have more data, increasing computational load
+  # Increase coverage every 8 patients
   if ((patient_id %% 8) == 0) {
     coverage = coverage + 15
     print(paste("Increased coverage to:", coverage))
@@ -136,5 +182,5 @@ print("Summary:")
 print(paste("- Total patients:", num_patients))
 print(paste("- Output structure: data/patient_XX_[risk_level]/"))
 print(paste("- Cancer gene information: data/cancer_gene_expression/"))
-print(paste("- Expected runtime for salmon/kallisto: ~30 minutes"))
+print(paste("- Expected runtime for salmon/kallisto: ~15-25 minutes"))
 print(paste("- Expected runtime for needle: ~2-5 minutes"))
